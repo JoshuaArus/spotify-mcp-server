@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { setPlaybackCheckDelay } from '../build/play.js';
 import { connect, mockConfig, mockHttp, resultText } from './helpers.js';
+
+setPlaybackCheckDelay(0);
 
 const track = {
   id: 'track1',
@@ -26,6 +29,14 @@ const device = {
   volume_percent: 50,
 };
 const devices = { url: 'me/player/devices', response: { devices: [device] } };
+const trackLookup = {
+  url: 'tracks/track1',
+  response: { ...track, album: { ...album, uri: 'spotify:album:album1' } },
+};
+const playing = (item, isPlaying = true) => ({
+  url: 'me/player',
+  response: { is_playing: isPlaying, device, item },
+});
 const cases = [
   {
     name: 'searchSpotify',
@@ -136,11 +147,16 @@ const cases = [
     args: { type: 'track', id: 'track1' },
     http: [
       devices,
+      trackLookup,
       {
         url: 'me/player/play?device_id=device1',
         method: 'PUT',
-        body: { uris: ['spotify:track:track1'] },
+        body: {
+          context_uri: 'spotify:album:album1',
+          offset: { uri: 'spotify:track:track1' },
+        },
       },
+      playing({ uri: 'spotify:track:track1' }),
     ],
     text: /Now playing/,
   },
@@ -420,6 +436,97 @@ test('getFollowedArtists pages by cursor', async (t) => {
   );
   assert.match(last, /1\. Third Artist - ID: artist3/);
   assert.doesNotMatch(last, /More available|undefined/);
+});
+
+test('playMusic starts a track inside its album and waits until it plays', async (t) => {
+  mockConfig(t);
+  mockHttp(t, [
+    devices,
+    trackLookup,
+    {
+      url: 'me/player/play?device_id=device1',
+      method: 'PUT',
+      body: {
+        context_uri: 'spotify:album:album1',
+        offset: { uri: 'spotify:track:track1' },
+      },
+    },
+    playing({ uri: 'spotify:track:previous' }),
+    playing({ uri: 'spotify:track:track1' }),
+  ]);
+  const client = await connect(t);
+  const result = await client.callTool({
+    name: 'playMusic',
+    arguments: { uri: 'spotify:track:track1' },
+  });
+  assert.equal(result.isError, undefined);
+  assert.match(resultText(result), /Now playing: spotify:track:track1/);
+});
+
+test('playMusic falls back to a bare track URI when the album is unknown', async (t) => {
+  mockConfig(t);
+  mockHttp(t, [
+    devices,
+    {
+      url: 'tracks/track1',
+      status: 404,
+      response: { error: { message: 'Not found' } },
+    },
+    {
+      url: 'me/player/play?device_id=device1',
+      method: 'PUT',
+      body: { uris: ['spotify:track:track1'] },
+    },
+    { url: 'me/player', status: 204 },
+    // Track relinking: Spotify plays a market copy and names the original.
+    playing({
+      uri: 'spotify:track:relinked',
+      linked_from: { uri: 'spotify:track:track1' },
+    }),
+  ]);
+  const client = await connect(t);
+  const result = await client.callTool({
+    name: 'playMusic',
+    arguments: { type: 'track', id: 'track1' },
+  });
+  assert.match(resultText(result), /Now playing: spotify:track:track1/);
+});
+
+test('playMusic reports an error when Spotify accepts the track but never plays it', async (t) => {
+  mockConfig(t);
+  mockHttp(t, [
+    devices,
+    { url: 'tracks/track1', response: { ...track, album: null } },
+    {
+      url: 'me/player/play?device_id=device1',
+      method: 'PUT',
+      body: { uris: ['spotify:track:track1'] },
+    },
+    playing({ uri: 'spotify:track:other' }),
+    playing({ uri: 'spotify:track:other' }),
+    playing({ uri: 'spotify:track:track1' }, false),
+    playing({ uri: 'spotify:track:other' }),
+  ]);
+  const client = await connect(t);
+  const result = await client.callTool({
+    name: 'playMusic',
+    arguments: { uri: 'spotify:track:track1' },
+  });
+  assert.equal(result.isError, true);
+  assert.equal(result.content[0].isError, undefined);
+  assert.match(
+    result.content[0].text,
+    /spotify:track:track1 is not playing \(currently: spotify:track:other\)/,
+  );
+});
+
+test('playMusic flags invalid input as a tool error', async (t) => {
+  mockConfig(t);
+  mockHttp(t, []);
+  const client = await connect(t);
+  const result = await client.callTool({ name: 'playMusic', arguments: {} });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /Must provide a "uri"/);
 });
 
 const queuePost = (uri, deviceId) => ({

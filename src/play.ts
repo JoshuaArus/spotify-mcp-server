@@ -51,6 +51,61 @@ async function ensureActiveDevice(preferredDeviceId?: string): Promise<string> {
   return target.id;
 }
 
+// Spotify answers 204 to a play request even when the device then plays
+// nothing (or resumes its own queue), so a track start is confirmed by
+// re-reading the player a few times. Tests shorten the spacing.
+const PLAYBACK_CHECKS = 4;
+let playbackCheckDelayMs = 600;
+
+export function setPlaybackCheckDelay(ms: number): void {
+  playbackCheckDelayMs = ms;
+}
+
+type PlayerItem = { uri?: string; linked_from?: { uri?: string } | null };
+
+/**
+ * Polls me/player until `uri` is the playing item (directly or through track
+ * relinking). Returns null on success, otherwise what was playing last.
+ */
+async function confirmPlaying(uri: string): Promise<string | null> {
+  let current = 'nothing';
+  for (let check = 0; check < PLAYBACK_CHECKS; check++) {
+    await new Promise((r) => setTimeout(r, playbackCheckDelayMs));
+    const player = await spotifyFetch<{
+      is_playing?: boolean;
+      item?: PlayerItem | null;
+    }>('me/player');
+    const item = player?.item;
+    if (
+      player?.is_playing &&
+      (item?.uri === uri || item?.linked_from?.uri === uri)
+    ) {
+      return null;
+    }
+    current = item?.uri
+      ? `${item.uri}${player?.is_playing ? '' : ' (paused)'}`
+      : 'nothing';
+  }
+  return current;
+}
+
+/**
+ * Album URI of a track, or undefined when Spotify can't tell (unknown track,
+ * missing album). Starting the album at the track plays reliably, while a bare
+ * `uris: [track]` request is sometimes accepted and then ignored.
+ */
+async function albumOfTrack(trackUri: string): Promise<string | undefined> {
+  const id = trackUri.split(':').pop();
+  try {
+    const track = await spotifyFetch<{ album?: { uri?: string } | null }>(
+      `tracks/${encodeURIComponent(id ?? '')}`,
+    );
+    return track?.album?.uri || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 const playMusic = defineTool({
   name: 'playMusic',
   description:
@@ -99,9 +154,9 @@ const playMusic = defineTool({
           {
             type: 'text',
             text: 'Error: Must provide a "uri" (e.g. spotify:track:xxx) or both "type" and "id"',
-            isError: true,
           },
         ],
+        isError: true,
       };
     }
 
@@ -122,13 +177,21 @@ const playMusic = defineTool({
           return;
         }
         if (resolvedType === 'track') {
-          await spotifyApi.player.startResumePlayback(
-            activeDeviceId,
-            undefined,
-            [spotifyUri],
-            undefined,
-            offset,
-          );
+          const albumUri = await albumOfTrack(spotifyUri);
+          if (albumUri) {
+            await spotifyApi.player.startResumePlayback(
+              activeDeviceId,
+              albumUri,
+              undefined,
+              { uri: spotifyUri },
+            );
+          } else {
+            await spotifyApi.player.startResumePlayback(
+              activeDeviceId,
+              undefined,
+              [spotifyUri],
+            );
+          }
         } else {
           // album, playlist, artist — use context_uri + optional offset
           await spotifyApi.player.startResumePlayback(
@@ -140,15 +203,29 @@ const playMusic = defineTool({
         }
       });
 
+      if (spotifyUri && resolvedType === 'track') {
+        const current = await confirmPlaying(spotifyUri);
+        if (current) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Error playing music: Spotify accepted the request but ${spotifyUri} is not playing (currently: ${current})`,
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+
       return {
         content: [{ type: 'text', text: `Now playing: ${spotifyUri}` }],
       };
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       return {
-        content: [
-          { type: 'text', text: `Error playing music: ${msg}`, isError: true },
-        ],
+        content: [{ type: 'text', text: `Error playing music: ${msg}` }],
+        isError: true,
       };
     }
   },
